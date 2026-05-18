@@ -66,8 +66,8 @@ def test_dataset_loading():
     try:
         from datasets import load_dataset
         
-        # Set cache directory
-        os.environ['HF_DATASETS_CACHE'] = 'C:/tmp/huggingface/datasets'
+        # Keep dataset downloads inside the repository cache.
+        os.environ['HF_DATASETS_CACHE'] = '.cache/huggingface/datasets'
         
         print("📥 Downloading HH dataset...")
         dataset = load_dataset('Anthropic/hh-rlhf', split='train[:10]')  # Load only the first 10 samples for testing
