@@ -16,6 +16,9 @@ debug: false
 # the port to use for FSDP
 fsdp_port: null
 
+# whether to offload FSDP parameters/gradients to CPU to reduce GPU memory
+fsdp_cpu_offload: false
+
 # which dataset(s) to train on; can pass a list like datasets=[hh,shp]
 datasets:
 - hh

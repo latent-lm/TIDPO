@@ -8,8 +8,22 @@ import tqdm
 import random
 from bs4 import BeautifulSoup, NavigableString
 import numpy as np
-from typing import Dict, List, Optional, Iterator, Callable, Union, Tuple
+from typing import Any, Dict, List, Optional, Iterator, Callable, Union, Tuple
 import os
+
+
+CHAT_DATASET_CONFIGS = {
+    'h4_ultrafeedback_binarized': {
+        'path': 'HuggingFaceH4/ultrafeedback_binarized',
+        'splits': {'train': 'train_prefs', 'test': 'test_prefs'},
+        'truncation_mode': 'keep_end',
+    },
+    'princeton_llama3_ultrafeedback': {
+        'path': 'princeton-nlp/llama3-ultrafeedback',
+        'splits': {'train': 'train', 'test': 'test'},
+        'truncation_mode': 'keep_end',
+    },
+}
 
 
 def extract_anthropic_prompt(prompt_and_response):
@@ -167,14 +181,74 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[
     return data
 
 
-def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = None):
-    """Load the given dataset by name. Supported by default are 'shp', 'hh', and 'se'."""
+def _chat_prompt(messages: List[Dict[str, str]], tokenizer) -> str:
+    """Render chat messages as a prompt ending at the assistant header."""
+    if hasattr(tokenizer, 'apply_chat_template'):
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    rendered = ['<|begin_of_text|>']
+    for message in messages:
+        rendered.append(
+            f"<|start_header_id|>{message['role']}<|end_header_id|>\n\n"
+            f"{message['content']}<|eot_id|>"
+        )
+    rendered.append('<|start_header_id|>assistant<|end_header_id|>\n\n')
+    return ''.join(rendered)
+
+
+def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    return [{'role': str(message['role']), 'content': str(message['content'])} for message in messages]
+
+
+def _split_preference_messages(row: Dict[str, Any]) -> Tuple[List[Dict[str, str]], str, str]:
+    chosen_messages = _normalize_messages(row['chosen'])
+    rejected_messages = _normalize_messages(row['rejected'])
+    if not chosen_messages or not rejected_messages:
+        raise ValueError('Preference row must contain non-empty chosen/rejected message lists')
+    if chosen_messages[-1]['role'] != 'assistant' or rejected_messages[-1]['role'] != 'assistant':
+        raise ValueError('Preference rows must end with assistant responses')
+    return chosen_messages[:-1], chosen_messages[-1]['content'], rejected_messages[-1]['content']
+
+
+def get_chat_preference_dataset(name: str, split: str, tokenizer, silent: bool = False, cache_dir: str = None) -> Dict[
+    str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    """Load a Hugging Face chat preference dataset with chosen/rejected message columns."""
+    config = CHAT_DATASET_CONFIGS[name]
+    hf_split = config['splits'].get(split, split)
+    print(f"Loading {config['path']} ({hf_split} split) from Huggingface...")
+    dataset = datasets.load_dataset(config['path'], split=hf_split, cache_dir=cache_dir)
+    print('done')
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(dataset, desc=f'Processing {name}', disable=silent):
+        try:
+            prompt_messages, chosen, rejected = _split_preference_messages(row)
+            prompt = _chat_prompt(prompt_messages, tokenizer)
+        except Exception as e:
+            if not silent:
+                print(f"Skipping invalid sample: {e}")
+            continue
+
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend([chosen, rejected])
+        data[prompt]['sft_target'] = chosen
+
+    return data
+
+
+def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = None, tokenizer=None):
+    """Load the given dataset by name. Supported by default are 'shp', 'hh', 'se', and UltraFeedback aliases."""
     if name == 'shp':
         data = get_shp(split, silent=silent, cache_dir=cache_dir)
     elif name == 'hh':
         data = get_hh(split, silent=silent, cache_dir=cache_dir)
     elif name == 'se':
         data = get_se(split, silent=silent, cache_dir=cache_dir)
+    elif name in CHAT_DATASET_CONFIGS:
+        if tokenizer is None:
+            raise ValueError(f"Dataset '{name}' requires a tokenizer for chat-template formatting")
+        data = get_chat_preference_dataset(name, split, tokenizer=tokenizer, silent=silent, cache_dir=cache_dir)
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
@@ -251,7 +325,7 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
     rejected_tokens = tokenizer(rejected, add_special_tokens=False)
     prompt_tokens = tokenizer(prompt, add_special_tokens=False)
 
-    assert tokenizer.eos_token_id not in prompt_tokens['input_ids'], f"Prompt contains EOS token: {prompt}"
+    # Chat templates may use EOS/EOT-like special tokens as turn separators inside the prompt.
     assert tokenizer.eos_token_id not in chosen_tokens['input_ids'], f"Chosen response contains EOS token: {chosen}"
     assert tokenizer.eos_token_id not in rejected_tokens['input_ids'], f"Rejected response contains EOS token: {rejected}"
 
@@ -342,8 +416,11 @@ def get_batch_iterator(names: List[str],
         permutation_seeds = iter(np.random.randint(0, 2 ** 31, size=1000000))
         flat_data = []
         for name in names:
-            truncation_mode = 'keep_end' if name == 'hh' else 'keep_start'
-            for prompt, data in get_dataset(name, split, silent=silent, cache_dir=cache_dir).items():
+            truncation_mode = CHAT_DATASET_CONFIGS.get(name, {}).get(
+                'truncation_mode',
+                'keep_end' if name == 'hh' else 'keep_start',
+            )
+            for prompt, data in get_dataset(name, split, silent=silent, cache_dir=cache_dir, tokenizer=tokenizer).items():
                 flat_data.append((prompt, data['responses'], data['pairs'], data['sft_target'], truncation_mode))
 
     collate_fn = get_collate_fn(tokenizer)
